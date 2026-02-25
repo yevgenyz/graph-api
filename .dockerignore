@@ -14,4 +14,4 @@ venv/
 tests/
 *.md
 .dockerignore
-.idea/
+.idea
