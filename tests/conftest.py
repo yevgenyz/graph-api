@@ -1,7 +1,7 @@
 import pytest
 
 from org.xyz.backslash.models.graph import GraphData
-from org.xyz.backslash.services.graph_repository import GraphRepository
+from org.xyz.backslash.services.graph_repository import GraphLoader, GraphRepository
 
 FIXTURE_DATA = {
     "nodes": [
@@ -22,6 +22,16 @@ FIXTURE_DATA = {
 }
 
 
+class InMemoryLoader(GraphLoader):
+    """Test loader that serves a pre-built GraphData without touching the filesystem."""
+
+    def __init__(self, data: dict) -> None:
+        self._data = data
+
+    def load(self) -> GraphData:
+        return GraphData.model_validate(self._data)
+
+
 @pytest.fixture
 def repo() -> GraphRepository:
-    return GraphRepository._from_graph_data(GraphData.model_validate(FIXTURE_DATA))
+    return GraphRepository(InMemoryLoader(FIXTURE_DATA))

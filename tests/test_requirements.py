@@ -1,6 +1,5 @@
 """
 Integration tests verifying the three explicit API requirements via POST /query.
-GET /query is covered by a small compatibility class at the bottom.
 
 Dataset facts (train-ticket.json):
   Public nodes:      frontend (has edges), gateway-service (no edges → no paths)
@@ -12,9 +11,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from org.xyz.backslash.main import app
-from org.xyz.backslash.api.dependencies import get_repository
+from org.xyz.backslash.api.dependencies import get_loader, get_repository
 
-_REPO = get_repository()
+_REPO = get_repository(get_loader())
 
 PUBLIC_NODE_NAMES               = {n.name for n in _REPO.all_nodes() if n.public_exposed}
 PUBLIC_NODES_WITH_EDGES         = {n.name for n in _REPO.all_nodes() if n.public_exposed and _REPO.neighbors(n.name)}
@@ -199,4 +198,3 @@ class TestCombinedFilters:
         assert body["nodes"] == []
         assert body["edges"] == []
         assert body["meta"]["total_paths"] == 0
-

@@ -1,5 +1,5 @@
 import pytest
-from org.xyz.backslash.services.graph_repository import GraphRepository
+from org.xyz.backslash.services.graph_repository import GraphRepository, JsonFileLoader
 
 
 def test_node_lookup(repo):
@@ -57,7 +57,7 @@ def test_load_from_file(tmp_path):
         "edges": [{"from": "a", "to": "b"}],
     }))
     # Should not raise
-    repo = GraphRepository.from_file(data_file)
+    repo = GraphRepository(JsonFileLoader(data_file))
     assert repo.get_node("a") is not None
 
 
@@ -74,7 +74,7 @@ def test_invalid_severity_rejected(tmp_path):
         "edges": [],
     }))
     with pytest.raises(ValidationError):
-        GraphRepository.from_file(data_file)
+        GraphRepository(JsonFileLoader(data_file))
 
 
 def test_missing_required_field_rejected(tmp_path):
@@ -87,4 +87,4 @@ def test_missing_required_field_rejected(tmp_path):
         "edges": [],
     }))
     with pytest.raises(ValidationError):
-        GraphRepository.from_file(data_file)
+        GraphRepository(JsonFileLoader(data_file))

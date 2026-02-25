@@ -1,7 +1,7 @@
 # Train-Ticket Graph API
 
-A RESTful query engine over the [Train-Ticket](https://github.com/FudanSELab/train-ticket) microservice dependency
-graph, built with **FastAPI** and **Python 3.14**.
+A RESTful query engine over the [Train-Ticket](https://github.com/FudanSELab/train-ticket) microservice
+dependency graph, built with **FastAPI** and **Python 3.14**.
 
 ---
 
@@ -24,7 +24,7 @@ graph, built with **FastAPI** and **Python 3.14**.
 │   │   ├── graph.py             # Domain models: Node, Edge, Vulnerability, GraphData
 │   │   └── schemas.py           # API response models, decoupled from domain
 │   └── services/
-│       ├── graph_repository.py  # JSON loading, O(1) node lookup, adjacency map
+│       ├── graph_repository.py  # GraphLoader ABC, JsonFileLoader, GraphRepository
 │       ├── graph_query.py       # Iterative DFS, filter evaluation, result assembly
 │       └── filters.py           # Filter ABC, implementations, VulnerabilityParams, FilterParams
 ├── data/
@@ -48,65 +48,85 @@ graph, built with **FastAPI** and **Python 3.14**.
 
 ### Layer separation
 
-| Layer         | Module                         | Responsibility                                                       |
-|---------------|--------------------------------|----------------------------------------------------------------------|
-| Domain models | `models/graph.py`              | `Node`, `Edge`, `Vulnerability`, `GraphData` — pure data, no I/O     |
-| API schemas   | `models/schemas.py`            | Response shapes, serialisation aliases, no business logic            |
-| Repository    | `services/graph_repository.py` | Parse and validate JSON, build lookup structures                     |
-| Query service | `services/graph_query.py`      | DFS traversal, filter evaluation, result assembly                    |
-| Filters       | `services/filters.py`          | `Filter` ABC, concrete implementations, `FilterParams` request model |
-| Routes        | `api/routes/`                  | HTTP interface only — no logic, delegate to services                 |
-| DI            | `api/dependencies.py`          | `@lru_cache` singleton repository, per-request query service         |
-| Config        | `core/config.py`               | Typed settings from environment variables                            |
+| Layer | Module | Responsibility |
+|---|---|---|
+| Domain models | `models/graph.py` | `Node`, `Edge`, `Vulnerability`, `GraphData` — pure data, no I/O |
+| API schemas | `models/schemas.py` | Response shapes, serialisation aliases, no business logic |
+| Repository | `services/graph_repository.py` | `GraphLoader` ABC, `JsonFileLoader`, index structures |
+| Query service | `services/graph_query.py` | DFS traversal, filter evaluation, result assembly |
+| Filters | `services/filters.py` | `Filter` ABC, concrete implementations, `FilterParams` request model |
+| Routes | `api/routes/` | HTTP interface only — no logic, delegate to services |
+| DI | `api/dependencies.py` | `get_loader → get_repository → get_query_service` via `Depends` |
+| Config | `core/config.py` | Typed settings from environment variables |
 
 ---
 
 ## Design decisions
 
+### GraphLoader — open/closed data loading
+
+`GraphRepository` accepts any `GraphLoader` implementation and has no knowledge of where data comes from
+or what format it is in. `JsonFileLoader` is the built-in implementation for local JSON files. Adding a
+new source (YAML, database, HTTP API) means adding a new `GraphLoader` subclass — `GraphRepository`, the
+query service, and the routes are unaffected. The test fixtures use an `InMemoryLoader` that serves a
+pre-built `GraphData` dict without touching the filesystem.
+
 ### Pydantic for data loading
 
-The graph JSON is parsed via `GraphData.model_validate_json()`. Field aliases map JSON names to Python names (
-`publicExposed` → `public_exposed`, `from`/`to` → `source`/`target`). A `@model_validator` on `GraphData` expands edges
-whose `"to"` value is a list into individual single-target edges before field parsing. Invalid data — unknown severity
-values, missing required fields — raises a `ValidationError` at startup.
+The graph JSON is parsed via `GraphData.model_validate_json()`. Field aliases map JSON names to Python
+names (`publicExposed` → `public_exposed`, `from`/`to` → `source`/`target`). A `@model_validator` on
+`GraphData` expands edges whose `"to"` value is a list into individual single-target edges before field
+parsing. Invalid data — unknown severity values, missing required fields — raises a `ValidationError`
+at startup.
 
 ### Iterative DFS
 
-`GraphQueryService` enumerates paths using an explicit stack rather than recursion. Each stack frame holds
-`(current_node, path_so_far, visited_set)`. Copying path and visited per frame gives each branch of the traversal an
-independent state, which is the iterative equivalent of backtracking in recursive DFS. The goal is exhaustive path
-enumeration, not shortest-path search, so DFS is the natural fit — BFS would still have to explore every branch and
-would carry larger per-frame state.
+`GraphQueryService` enumerates paths using an explicit stack rather than recursion. Each stack frame
+holds `(current_node, path_so_far, visited_set)`. Copying path and visited per frame gives each branch
+of the traversal an independent state, which is the iterative equivalent of backtracking in recursive
+DFS. The goal is exhaustive path enumeration, not shortest-path search, so DFS is the natural fit —
+BFS would still have to explore every branch and would carry larger per-frame state.
 
 ### `FilterParams` as the complete query model
 
-All query inputs — traversal constraints (`start`, `end`) and path filters (`starts_from_public`, `ends_at_sink`,
-`vulnerability`, `node_kind`) — are defined in a single Pydantic model and supplied together as a POST request body.
-This gives full Pydantic validation, automatic OpenAPI schema generation, and a single place to add new inputs. `start`
-and `end` are fields on `FilterParams` rather than query parameters; they do not produce filters but are read directly
-by the query service.
+All query inputs — traversal constraints (`start`, `end`) and path filters (`starts_from_public`,
+`ends_at_sink`, `vulnerability`, `node_kind`) — are defined in a single Pydantic model and supplied
+together as a POST request body. This gives full Pydantic validation, automatic OpenAPI schema
+generation, and a single place to add new inputs. `start` and `end` are fields on `FilterParams`
+rather than query parameters; they do not produce filters but are read directly by the query service.
 
 ### `VulnerabilityParams` as a nested object
 
-The vulnerability filter has two orthogonal dimensions: whether to include or exclude matching paths (`exclude: bool`)
-and which severity level to scope to (`severity: Optional[VulnerabilitySeverity]`). These are grouped into a nested
-`VulnerabilityParams` object. Its presence in `FilterParams.vulnerability` means "apply this filter"; its absence
-means "don't filter by vulnerability at all". Unknown fields in the request body are silently ignored (Pydantic's
-default `extra="ignore"`) to allow new fields to be deployed server-side without breaking existing clients.
+The vulnerability filter has two orthogonal dimensions: whether to include or exclude matching paths
+(`exclude: bool`) and which severity level to scope to (`severity: Optional[VulnerabilitySeverity]`).
+These are grouped into a nested `VulnerabilityParams` object. Its presence in `FilterParams.vulnerability`
+means "apply this filter"; its absence means "don't filter by vulnerability at all". Unknown fields in
+the request body are silently ignored (Pydantic's default `extra="ignore"`) to allow new fields to be
+deployed server-side without breaking existing clients.
 
 ### Domain models vs API schemas
 
-`Node`, `Edge`, and `Vulnerability` in `models/graph.py` carry business logic (`is_sink`, `has_vulnerability`,
-`vulnerabilities_by_severity`) and use Python naming conventions. The `*Response` models in `models/schemas.py` are the
-external contract — they use JSON naming conventions via field aliases (`from`/`to`, `publicExposed`) and contain no
-logic. Serialisation concerns do not leak into the domain layer.
+`Node`, `Edge`, and `Vulnerability` in `models/graph.py` carry business logic (`is_sink`,
+`has_vulnerability`, `vulnerabilities_by_severity`) and use Python naming conventions. The `*Response`
+models in `models/schemas.py` are the external contract — they use JSON naming conventions via field
+aliases (`from`/`to`, `publicExposed`) and contain no logic. Serialisation concerns do not leak into
+the domain layer.
 
 ### Dependency injection and caching
 
-`get_repository()` is decorated with `@lru_cache` and takes no arguments, producing a single `GraphRepository` instance
-per process. Settings are read inside the function rather than passed as a parameter — Pydantic `BaseModel` instances
-are not hashable and cannot be `lru_cache` arguments. `get_query_service()` is lightweight and created per-request via
-`Depends`.
+The dependency chain is declared explicitly so FastAPI can wire and override each step independently:
+
+```
+get_settings() → get_loader() → get_repository() → get_query_service()
+```
+
+`get_loader` and `get_repository` are both decorated with `@lru_cache` for process-level singletons.
+`get_loader` always returns the same instance, so `get_repository`'s cache always sees the same key —
+plain Python objects are hashable by identity by default — and the repository is constructed exactly
+once. `get_query_service` is stateless and cheap, so it is created per-request with no caching needed.
+
+Each level is independently overridable via `app.dependency_overrides` in tests: the loader can be
+swapped without touching the repository, and the repository without touching the query service.
 
 ---
 
@@ -160,12 +180,12 @@ pytest
 
 Settings are read from environment variables (prefix `APP_`) or a `.env` file.
 
-| Variable        | Default                  | Description        |
-|-----------------|--------------------------|--------------------|
-| `APP_LOG_LEVEL` | `info`                   | Log level          |
+| Variable | Default | Description |
+|---|---|---|
+| `APP_LOG_LEVEL` | `info` | Log level |
 | `APP_DATA_FILE` | `data/train-ticket.json` | Path to graph JSON |
-| `APP_HOST`      | `0.0.0.0`                | Bind host          |
-| `APP_PORT`      | `8080`                   | Bind port          |
+| `APP_HOST` | `0.0.0.0` | Bind host |
+| `APP_PORT` | `8080` | Bind port |
 
 ---
 
@@ -174,9 +194,7 @@ Settings are read from environment variables (prefix `APP_`) or a `.env` file.
 ### `GET /health`
 
 ```json
-{
-  "status": "ok"
-}
+{"status": "ok"}
 ```
 
 ### `GET /api/graph`
@@ -189,103 +207,61 @@ Returns a filtered sub-graph. All inputs are optional and combinable.
 
 **Request body:**
 
-| Field                | Type                  | Description                                                   |
-|----------------------|-----------------------|---------------------------------------------------------------|
-| `start`              | `string`              | Constrain traversal to paths originating from this node       |
-| `end`                | `string`              | Constrain traversal to paths terminating at this node         |
-| `starts_from_public` | `bool`                | Include only paths whose first node has `publicExposed: true` |
-| `ends_at_sink`       | `bool`                | Include only paths whose last node is a sink (`rds` or `sqs`) |
-| `vulnerability`      | `VulnerabilityParams` | See below                                                     |
-| `node_kind`          | `string`              | Include only paths containing a node of this kind             |
+| Field | Type | Description |
+|---|---|---|
+| `start` | `string` | Constrain traversal to paths originating from this node |
+| `end` | `string` | Constrain traversal to paths terminating at this node |
+| `starts_from_public` | `bool` | Include only paths whose first node has `publicExposed: true` |
+| `ends_at_sink` | `bool` | Include only paths whose last node is a sink (`rds` or `sqs`) |
+| `vulnerability` | `VulnerabilityParams` | See below |
+| `node_kind` | `string` | Include only paths containing a node of this kind |
 
 **`VulnerabilityParams`:**
 
-| Field      | Type                        | Default | Description                                                |
-|------------|-----------------------------|---------|------------------------------------------------------------|
-| `severity` | `high` \| `medium` \| `low` | `null`  | Scope to a specific severity; omit for any                 |
-| `exclude`  | `bool`                      | `false` | `true` → include only paths with no matching vulnerability |
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `severity` | `high` \| `medium` \| `low` | `null` | Scope to a specific severity; omit for any |
+| `exclude` | `bool` | `false` | `true` → include only paths with no matching vulnerability |
 
 **Response shape:**
 
 ```json
 {
-  "nodes": [
-    ...
-  ],
-  "edges": [
-    {
-      "from": "...",
-      "to": "..."
-    }
-  ],
+  "nodes": [...],
+  "edges": [{"from": "...", "to": "..."}],
   "meta": {
     "total_paths": 12,
-    "active_filters": [
-      "starts_from_public",
-      "has_vulnerability"
-    ]
+    "active_filters": ["starts_from_public", "has_vulnerability"]
   }
 }
 ```
 
-The response includes all nodes that appear on a matching path, not only those that caused the path to match. For
-example, a vulnerability filter returns the vulnerable node and all other nodes on the same path.
+The response includes all nodes that appear on a matching path, not only those that caused the path
+to match. For example, a vulnerability filter returns the vulnerable node and all other nodes on
+the same path.
 
 **Examples:**
 
 ```json
-{
-  "start": "user-service",
-  "end": "prod-postgresdb"
-}
+{"start": "user-service", "end": "prod-postgresdb"}
 ```
-
 ```json
-{
-  "starts_from_public": true,
-  "ends_at_sink": true
-}
+{"starts_from_public": true, "ends_at_sink": true}
 ```
-
 ```json
-{
-  "vulnerability": {}
-}
+{"vulnerability": {}}
 ```
-
 ```json
-{
-  "vulnerability": {
-    "severity": "high"
-  }
-}
+{"vulnerability": {"severity": "high"}}
 ```
-
 ```json
-{
-  "vulnerability": {
-    "exclude": true
-  }
-}
+{"vulnerability": {"exclude": true}}
 ```
-
 ```json
-{
-  "vulnerability": {
-    "exclude": true,
-    "severity": "high"
-  }
-}
+{"vulnerability": {"exclude": true, "severity": "high"}}
 ```
-
 ```json
-{
-  "starts_from_public": true,
-  "vulnerability": {
-    "severity": "high"
-  },
-  "node_kind": "rds"
-}
+{"starts_from_public": true, "vulnerability": {"severity": "high"}, "node_kind": "rds"}
 ```
 
 ### `GET /api/graph/filters`
@@ -302,6 +278,27 @@ Returns a single node by name. `404` if not found.
 
 ---
 
+## Adding a new data source
+
+Implement `GraphLoader` and pass it to `GraphRepository`:
+
+```python
+class YamlFileLoader(GraphLoader):
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    def load(self) -> GraphData:
+        import yaml
+        return GraphData.model_validate(yaml.safe_load(self._path.read_text()))
+
+# In dependencies.py or wherever the repo is constructed:
+repo = GraphRepository(YamlFileLoader(Path("data/graph.yaml")))
+```
+
+Nothing above `GraphRepository` changes.
+
+---
+
 ## Extending the filter system
 
 Adding a new filter requires two changes:
@@ -314,7 +311,6 @@ class IsDeprecatedFilter(Filter):
             (node := repo.get_node(n)) is not None and node.metadata.get("deprecated")
             for n in path
         )
-
 
 # 2. Add a field and a branch to FilterParams in the same file
 class FilterParams(BaseModel):
