@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import Optional
+
+from pydantic import BaseModel
 
 from org.xyz.backslash.models.graph import VulnerabilitySeverity
 from org.xyz.backslash.services.graph_repository import GraphRepository
@@ -16,8 +17,8 @@ class Filter(ABC):
     `accepts` returns True if the path satisfies this filter's condition.
 
     Adding a new filter:
-      1. Add a typed field to FilterParams.
-      2. Subclass Filter and implement `name` and `accepts`.
+      1. Subclass Filter and implement `accepts`.
+      2. Add a typed field to FilterParams.
       3. Add a branch in FilterParams.to_filters().
     """
 
@@ -62,25 +63,35 @@ class EndsAtSinkFilter(Filter):
 
 class HasVulnerabilityFilter(Filter):
     """
-    Accepts paths where at least one node has a vulnerability.
-    Optionally scoped to a specific severity level.
+    Filters paths by presence or absence of vulnerabilities.
+
+    exclude=False (default): accepts paths where at least one node has a vulnerability.
+    exclude=True:            accepts paths where no node has a vulnerability.
+
+    Both modes optionally scope to a specific severity level.
     """
 
-    def __init__(self, severity: Optional[VulnerabilitySeverity] = None) -> None:
+    def __init__(
+        self,
+        severity: Optional[VulnerabilitySeverity] = None,
+        exclude: bool = False,
+    ) -> None:
         if severity is not None and not isinstance(severity, VulnerabilitySeverity):
             raise TypeError(
                 f"severity must be a VulnerabilitySeverity enum member, got {type(severity).__name__!r}"
             )
         self._severity = severity
+        self._exclude = exclude
 
     @property
     def name(self) -> str:
-        return (
-            f"has_vulnerability[severity={self._severity.value}]"
-            if self._severity else "has_vulnerability"
-        )
+        base = "no_vulnerability" if self._exclude else "has_vulnerability"
+        if self._severity:
+            return f"{base}[severity={self._severity.value}]"
+        return base
 
-    def accepts(self, path: list[str], repo: GraphRepository) -> bool:
+    def _node_matches(self, path: list[str], repo: GraphRepository) -> bool:
+        """Return True if any node on the path has a matching vulnerability."""
         for node_name in path:
             node = repo.get_node(node_name)
             if node and node.vulnerabilities:
@@ -89,6 +100,10 @@ class HasVulnerabilityFilter(Filter):
                 if any(v.severity == self._severity for v in node.vulnerabilities):
                     return True
         return False
+
+    def accepts(self, path: list[str], repo: GraphRepository) -> bool:
+        matched = self._node_matches(path, repo)
+        return not matched if self._exclude else matched
 
 
 class NodeKindFilter(Filter):
@@ -112,28 +127,47 @@ class NodeKindFilter(Filter):
 # Typed filter parameters — single source of truth for available filters
 # ---------------------------------------------------------------------------
 
-@dataclass
-class FilterParams:
+class VulnerabilityParams(BaseModel):
     """
-    Typed representation of all available query filters.
+    Groups vulnerability filter options into a single coherent object.
 
-    This is the single definition that both the route (FastAPI query params)
-    and the service (filter instantiation) derive from — eliminating the
-    string-key duplication that existed between FILTER_REGISTRY and the
-    route function signature.
+    Presence of this object means "filter by vulnerability". The optional
+    fields narrow the filter:
 
-    `has_vulnerability` and `vulnerability_severity` are intentionally
-    separate: the former is the boolean "filter by vulnerability at all",
-    the latter optionally narrows it to a specific severity. This keeps
-    the enum typed and avoids overloading a single field with two meanings.
+      {}                              → paths containing any vulnerability
+      {"severity": "high"}           → paths containing a high-severity vulnerability
+      {"exclude": true}              → paths containing NO vulnerabilities
+      {"exclude": true, "severity": "high"} → paths containing no high-severity vulnerability
+    """
+    severity: Optional[VulnerabilitySeverity] = None
+    exclude: bool = False
 
-    Adding a new filter: add a field here and a branch in `to_filters`.
+    def to_filter(self) -> HasVulnerabilityFilter:
+        return HasVulnerabilityFilter(severity=self.severity, exclude=self.exclude)
+
+
+class FilterParams(BaseModel):
+    """
+    Pydantic model representing a complete graph query.
+
+    Used as a POST request body, giving us Pydantic validation, clear
+    OpenAPI schema generation, and a single place to define query inputs.
+
+    `start` and `end` constrain the traversal to a specific source/destination
+    node. All other fields are filters applied to the resulting paths.
+
+    `vulnerability` is an optional nested object — its presence means "apply
+    the vulnerability filter", its absence means "don't", with no incoherent
+    intermediate state.
+
+    Adding a new filter: add a typed field here and a branch in to_filters().
     """
 
+    start: Optional[str] = None
+    end: Optional[str] = None
     starts_from_public: bool = False
     ends_at_sink: bool = False
-    has_vulnerability: bool = False
-    vulnerability_severity: Optional[VulnerabilitySeverity] = None
+    vulnerability: Optional[VulnerabilityParams] = None
     node_kind: Optional[str] = None
 
     def to_filters(self) -> list[Filter]:
@@ -142,8 +176,8 @@ class FilterParams:
             filters.append(StartsFromPublicFilter())
         if self.ends_at_sink:
             filters.append(EndsAtSinkFilter())
-        if self.has_vulnerability:
-            filters.append(HasVulnerabilityFilter(severity=self.vulnerability_severity))
+        if self.vulnerability is not None:
+            filters.append(self.vulnerability.to_filter())
         if self.node_kind is not None:
             filters.append(NodeKindFilter(kind=self.node_kind))
         return filters
